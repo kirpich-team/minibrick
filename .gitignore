@@ -3,3 +3,6 @@ node_modules/
 reminders.json
 .DS_Store
 *.log
+node_modules/
+.env
+.DS_Store
