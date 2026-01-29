@@ -1,5 +1,4 @@
 process.env.TZ = 'Europe/Moscow';
-
 require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const schedule = require('node-schedule');
@@ -7,25 +6,18 @@ const chrono = require('chrono-node');
 const fs = require('fs');
 const path = require('path');
 
-// --- КОНФИГУРАЦИЯ ---
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const MISTRAL_KEY = process.env.MISTRAL_API_KEY;
-const BOT_TAG = '@minibrickbot'; 
 const API_URL = 'https://api.mistral.ai/v1/chat/completions';
 const MODEL = 'mistral-small-latest';
 const REMINDERS_FILE = path.join(__dirname, 'reminders.json');
 
 const bot = new Telegraf(TELEGRAM_TOKEN);
-
-// --- ХРАНИЛИЩЕ ---
 let reminders = [];
-if (fs.existsSync(REMINDERS_FILE)) {
-    try { reminders = JSON.parse(fs.readFileSync(REMINDERS_FILE)); } catch (e) {}
-}
+try { if (fs.existsSync(REMINDERS_FILE)) reminders = JSON.parse(fs.readFileSync(REMINDERS_FILE)); } catch (e) {}
 
-function saveReminders() {
-    fs.writeFileSync(REMINDERS_FILE, JSON.stringify(reminders, null, 2));
-}
+function saveReminders() { fs.writeFileSync(REMINDERS_FILE, JSON.stringify(reminders, null, 2)); }
+function formatTime(iso) { return new Date(iso).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow', hour: '2-digit', minute: '2-digit', day: 'numeric', month: 'long' }); }
 
 function scheduleJob(reminder) {
     const jobTime = new Date(reminder.time);
@@ -35,187 +27,118 @@ function scheduleJob(reminder) {
         return;
     }
     schedule.scheduleJob(jobTime, function() {
-        bot.telegram.sendMessage(reminder.chatId, 
-            `🔔 <b>НАПОМИНАНИЕ!</b>\n\n📝 "${reminder.text}"\n👤 Для: ${reminder.user}`, 
-            { parse_mode: 'HTML' }
-        ).catch(err => console.error("Ошибка отправки:", err.message));
-        
+        bot.telegram.sendMessage(reminder.chatId, `🔔 <b>Напоминание</b>\n\n▫️ ${reminder.text}`, { parse_mode: 'HTML' }).catch(() => {});
         reminders = reminders.filter(r => r.id !== reminder.id);
         saveReminders();
     });
 }
 reminders.forEach(scheduleJob);
 
-// --- МОЗГ БОТА (MISTRAL) ---
-async function getAIResponse(text, contextReminders) {
-    const now = new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' });
-    
-    const remindersContext = contextReminders.length > 0 
-        ? "ТЕКУЩИЕ НАПОМИНАНИЯ:\n" + contextReminders.map(r => `- ${r.text} (${new Date(r.time).toLocaleTimeString()})`).join("\n")
-        : "Список пуст.";
-
+async function getAIResponse(text) {
     const systemPrompt = `
-    Ты — умный строительный ассистент и секретарь. Время: ${now}.
-    ${remindersContext}
-
-    ИНСТРУКЦИЯ ПО ОТВЕТАМ:
-    1. Сначала ответь на вопрос пользователя текстом (про укладку, пироги пола и т.д.).
-    2. Если пользователь просит что-то сделать (напомнить, удалить, показать список) — добавь специальный блок КОМАНДЫ в конце ответа.
+    Ты ассистент Minibrick.
+    Если вопрос - отвечай кратко.
+    Если команда - отвечай ТОЛЬКО JSON-блоком.
     
-    ФОРМАТ КОМАНДЫ (пиши строго в конце сообщения):
+    ФОРМАТ JSON:
     <<<JSON
     {"actions": [
        {"type": "remind", "text": "...", "time": "..."},
-       {"type": "list"}
-    ]}
-    JSON>>>
-
-    ПРИМЕР 1 (Вопрос + Напоминание):
-    Пользователь: "Как мешать бетон? Напомни купить цемент через час."
-    Твой ответ:
-    Для бетона нужна пропорция 1:3:5...
-    <<<JSON
-    {"actions": [{"type": "remind", "text": "Купить цемент", "time": "через час"}]}
-    JSON>>>
-
-    ПРИМЕР 2 (Мульти-команда):
-    Пользователь: "Напомни позвонить маме в 5 и покажи список."
-    Твой ответ:
-    Сделано!
-    <<<JSON
-    {"actions": [
-       {"type": "remind", "text": "Позвонить маме", "time": "в 17:00"},
+       {"type": "delete", "keyword": "..."},
+       {"type": "clear_all"},
        {"type": "list"}
     ]}
     JSON>>>
     
-    Если команд нет, просто отвечай текстом без тегов JSON.
+    Примеры:
+    "Удали все" -> <<<JSON {"actions": [{"type": "clear_all"}]} JSON>>>
+    "Очисти список" -> <<<JSON {"actions": [{"type": "clear_all"}]} JSON>>>
     `;
 
     try {
         const response = await fetch(API_URL, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${MISTRAL_KEY}`
-            },
-            body: JSON.stringify({
-                model: MODEL,
-                messages: [
-                    { role: "system", content: systemPrompt },
-                    { role: "user", content: text }
-                ],
-                temperature: 0.5
-            })
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${MISTRAL_KEY}` },
+            body: JSON.stringify({ model: MODEL, messages: [{role: "system", content: systemPrompt}, {role: "user", content: text}], temperature: 0.1 })
         });
-
         const data = await response.json();
         return data.choices?.[0]?.message?.content || "";
-
-    } catch (e) {
-        console.error("AI Error:", e);
-        return "⚠️ Ошибка связи.";
-    }
+    } catch (e) { return "Ошибка AI"; }
 }
 
-// --- ОБРАБОТЧИК ---
 bot.on('text', async (ctx) => {
-    const msg = ctx.message.text;
-    const isGroup = ['group', 'supergroup'].includes(ctx.chat.type);
-    
-    const tagRegex = new RegExp(BOT_TAG, 'i');
-    const isMentioned = tagRegex.test(msg);
-    const isReply = ctx.message.reply_to_message?.from?.username === ctx.botInfo.username;
-
-    if (isGroup && !isMentioned && !isReply) return;
-
-    const cleanText = msg.replace(tagRegex, '').trim();
-    if (!cleanText && !isReply) return;
-
-    ctx.sendChatAction('typing');
-
-    const chatReminders = reminders.filter(r => r.chatId === ctx.chat.id);
-    const rawResponse = await getAIResponse(cleanText, chatReminders);
-
-    // --- ПАРСИНГ ОТВЕТА ---
-    // Ищем блок <<<JSON ... JSON>>>
-    const jsonRegex = /<<<JSON([\s\S]*?)JSON>>>/;
-    const match = rawResponse.match(jsonRegex);
-
-    let textToSend = rawResponse;
-    let actions = [];
-
-    if (match) {
-        // Если есть команды, отделяем их от текста
-        textToSend = rawResponse.replace(match[0], '').trim();
-        try {
-            const parsed = JSON.parse(match[1]);
-            if (parsed.actions) actions = parsed.actions;
-        } catch (e) {
-            console.error("JSON Parse Error", e);
-        }
-    }
-
-    // 1. Отправляем текстовый ответ (если есть)
-    if (textToSend) {
-        await ctx.reply(textToSend, { reply_to_message_id: ctx.message.message_id, parse_mode: 'Markdown' });
-    }
-
-    // 2. Выполняем действия
-    for (const action of actions) {
-        if (action.type === 'remind') {
-            const parsedDate = chrono.ru.parseDate(action.time, new Date(), { forwardDate: true });
-            
-            if (parsedDate) {
-                const newReminder = {
-                    id: Date.now().toString() + Math.random(),
-                    chatId: ctx.chat.id,
-                    user: ctx.from.first_name,
-                    time: parsedDate.toISOString(),
-                    text: action.text
-                };
-                reminders.push(newReminder);
-                saveReminders();
-                scheduleJob(newReminder);
-                
-                await ctx.reply(`✍️ <b>Добавлено напоминание:</b> "${action.text}"\n⏰ ${parsedDate.toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' })}`, { parse_mode: 'HTML' });
-            } else {
-                 await ctx.reply(`⚠️ Не смог понять время для напоминания: "${action.time}"`);
-            }
-        }
-
-        if (action.type === 'list') {
-            if (chatReminders.length === 0 && reminders.filter(r => r.chatId === ctx.chat.id).length === 0) { // Check refreshed list
-                 await ctx.reply("📂 Список напоминаний пуст.");
-            } else {
-                // Re-read reminders to include the one just added
-                const freshList = reminders.filter(r => r.chatId === ctx.chat.id);
-                const listText = freshList
-                    .sort((a,b) => new Date(a.time) - new Date(b.time))
-                    .map(r => `🔹 <b>${new Date(r.time).toLocaleString('ru-RU', { hour:'2-digit', minute:'2-digit', day:'numeric' })}</b>: ${r.text}`)
-                    .join('\n');
-                await ctx.reply(`📋 <b>Ваши напоминания:</b>\n${listText}`, { parse_mode: 'HTML' });
-            }
-        }
+    try {
+        const msg = ctx.message.text;
+        if (['group','supergroup'].includes(ctx.chat.type) && !msg.includes('@minibrickbot') && !ctx.message.reply_to_message) return;
         
-        if (action.type === 'delete') {
-             // Simple keyword deletion
-             const keyword = action.keyword?.toLowerCase();
-             const initialLen = reminders.length;
-             reminders = reminders.filter(r => !r.text.toLowerCase().includes(keyword));
-             
-             if (reminders.length < initialLen) {
-                 saveReminders();
-                 await ctx.reply(`🗑 Напоминание с "${keyword}" удалено.`);
-             } else {
-                 await ctx.reply(`🤷‍♂️ Не нашел напоминания с "${keyword}".`);
-             }
+        ctx.sendChatAction('typing');
+        const clean = msg.replace('@minibrickbot', '').trim();
+        const raw = await getAIResponse(clean);
+
+        const jsonRegex = /<<<JSON([\s\S]*?)JSON>>>/;
+        const match = raw.match(jsonRegex);
+        let textToSend = raw;
+        let actions = [];
+
+        if (match) {
+            textToSend = raw.replace(match[0], '').trim();
+            try { const p = JSON.parse(match[1]); actions = p.actions || []; } catch (e) {}
         }
-    }
+
+        if (textToSend.trim()) await ctx.reply(textToSend, { reply_to_message_id: ctx.message.message_id, parse_mode: 'Markdown' });
+
+        for (const a of actions) {
+            if (a.type === 'remind') {
+                const d = chrono.ru.parseDate(a.time, new Date(), { forwardDate: true });
+                if (d) {
+                    if (d < new Date() && a.time.includes('завтра')) d.setDate(d.getDate() + 1);
+                    const isDup = reminders.some(r => r.chatId === ctx.chat.id && r.text.toLowerCase() === a.text.toLowerCase() && Math.abs(new Date(r.time) - d) < 60000);
+                    if (!isDup) {
+                        const r = { id: Date.now()+Math.random().toString(), chatId: ctx.chat.id, text: a.text, time: d.toISOString() };
+                        reminders.push(r); saveReminders(); scheduleJob(r);
+                        await ctx.reply(`✍️ <b>Записал:</b> ${a.text}\n⏰ ${formatTime(d.toISOString())}`, { parse_mode: 'HTML' });
+                    }
+                }
+            }
+            if (a.type === 'list') {
+                const list = reminders.filter(r => r.chatId === ctx.chat.id).sort((x,y) => new Date(x.time)-new Date(y.time));
+                if (!list.length) { if (!textToSend.trim()) await ctx.reply("📂 Пусто."); }
+                else {
+                    const unique = []; const seen = new Set();
+                    list.forEach(r => { const k = r.text+r.time; if(!seen.has(k)){seen.add(k); unique.push(r);} });
+
+                    let msg = "📋 <b>Ваши задачи:</b>\n";
+                    let curDay = "";
+                    unique.forEach(r => {
+                        const d = new Date(r.time);
+                        const dayStr = d.toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', weekday: 'short', timeZone: 'Europe/Moscow' });
+                        const timeStr = d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Moscow' });
+                        if (dayStr !== curDay) { msg += `\n📅 <b>${dayStr}</b>\n`; curDay = dayStr; }
+                        msg += `   └ <code>${timeStr}</code> ${r.text}\n`;
+                    });
+                    await ctx.reply(msg, { parse_mode: 'HTML' });
+                }
+            }
+            if (a.type === 'delete') {
+                const k = a.keyword?.toLowerCase();
+                if (k) {
+                    const l = reminders.length;
+                    reminders = reminders.filter(r => r.chatId !== ctx.chat.id || !r.text.toLowerCase().includes(k));
+                    if (reminders.length < l) { saveReminders(); await ctx.reply(`🗑 Удалено: "${k}"`); }
+                    else await ctx.reply(`🔍 Не нашел: "${k}"`);
+                }
+            }
+            // NEW: Clear All
+            if (a.type === 'clear_all') {
+                const l = reminders.length;
+                reminders = reminders.filter(r => r.chatId !== ctx.chat.id);
+                if (reminders.length < l) { saveReminders(); await ctx.reply("🗑 Все задачи удалены."); }
+                else await ctx.reply("📂 Список и так пуст.");
+            }
+        }
+    } catch (e) { console.error(e); }
 });
 
-console.log("🚀 Бот (v4 - Мультизадачный) запущен!");
 bot.launch();
-
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
